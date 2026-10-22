@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ready: emergency kit planner</title>
+  <meta name="description" content="Build the right emergency kit for your household, adjusted for live weather alerts where you live.">
+
+  <!-- PWA: lets phones install Ready like an app -->
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#10263b">
+  <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png">
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Ready">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Ready</span>
+    </div>
+    <p class="brand-tag">The kit your household actually needs.</p>
+  </header>
+
+  <main class="layout">
+    <!-- ============ INPUTS ============ -->
+    <aside class="panel" aria-label="Your household">
+      <section class="group">
+        <h2>Where you live</h2>
+        <form class="loc-form" id="locForm">
+          <label class="sr-only" for="locInput">City or ZIP code</label>
+          <input type="text" id="locInput" placeholder="City or ZIP code" autocomplete="postal-code" enterkeyhint="search">
+          <button type="submit" class="btn" id="locFind">Find</button>
+        </form>
+        <button type="button" class="link-btn" id="locGeo">Use my location</button>
+        <p class="loc-status" id="locStatus" aria-live="polite"></p>
+      </section>
+
+      <section class="group">
+        <h2>Who's in your household</h2>
+        <ul class="counters" id="peopleList"></ul>
+        <h3 class="sub">Pets</h3>
+        <ul class="counters" id="petList"></ul>
+      </section>
+
+      <section class="group">
+        <h2>Your kit</h2>
+        <div class="seg" role="group" aria-label="Kit type" id="kitSeg">
+          <button type="button" data-kit="home">Home kit</button>
+          <button type="button" data-kit="bag">Go-bag</button>
+        </div>
+        <p class="hint" id="kitHint"></p>
+
+        <h3 class="sub">Days to cover</h3>
+        <div class="seg" role="group" aria-label="Days to cover" id="daysSeg">
+          <button type="button" data-days="3">3 days</button>
+          <button type="button" data-days="7">1 week</button>
+          <button type="button" data-days="14">2 weeks</button>
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>What your area usually faces</h2>
+        <p class="hint">Pick any that apply. Live alerts get added on top of these.</p>
+        <div class="chips" id="threatChips"></div>
+      </section>
+    </aside>
+
+    <!-- ============ OUTPUTS ============ -->
+    <section class="results" aria-label="Your kit">
+      <div id="alerts" aria-live="polite"></div>
+      <div class="tag" id="summary"></div>
+
+      <nav class="tabs" role="tablist" aria-label="Kit sections">
+        <button role="tab" class="tab" data-tab="kit">Kit list</button>
+        <button role="tab" class="tab" data-tab="plan">Buying plan</button>
+        <button role="tab" class="tab" data-tab="upkeep">Upkeep</button>
+      </nav>
+
+      <div class="tab-panel" id="panel-kit" role="tabpanel"></div>
+      <div class="tab-panel" id="panel-plan" role="tabpanel" hidden></div>
+      <div class="tab-panel" id="panel-upkeep" role="tabpanel" hidden></div>
+
+      <p class="footnote">
+        Ready is a planning tool, not official guidance. In an emergency, follow instructions from local officials.
+        Quantities follow Ready.gov and Red Cross guidance where they give numbers; prices are rough estimates you can edit.
+        Weather alerts come from the <a href="https://www.weather.gov/" target="_blank" rel="noopener">National Weather Service</a>.
+        Location search uses <a href="https://nominatim.openstreetmap.org/" target="_blank" rel="noopener">Nominatim</a>, data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>.
+        Your plan is saved on this device only.
+      </p>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+  <script>
+    // PWA: start the service worker so Ready can open offline
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
