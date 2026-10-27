@@ -4,7 +4,7 @@
    are never cached here; the app saves the last alerts itself and labels
    them with the time they were checked. */
 
-const CACHE = "ready-v1"; // bump this (ready-v2, ...) if you ever need to wipe old caches
+const CACHE = "ready-v2"; // bump this (ready-v3, ...) if you ever need to wipe old caches
 
 const CORE = [
   "./",

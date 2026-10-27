@@ -6,8 +6,8 @@
    3. APIs       - Nominatim (place search) and the National
                    Weather Service (live alerts).
    4. ENGINE     - turns the household into a kit list.
-   5. RENDER     - draws the page.
-   6. EVENTS     - wires up buttons and inputs.
+   5. SCREENS    - one function per screen, plus the router.
+   6. EVENTS     - one click/change/submit listener for the whole app.
    ============================================================ */
 
 /* ================= 1. CONSTANTS ================= */
@@ -22,6 +22,15 @@ const DOG_OZ_PER_LB_DAY = 1;
 const CAT_OZ_PER_DAY = 10;
 const OZ_PER_GAL = 128;
 const LB_PER_GAL = 8.34;
+
+// v2 interface numbers.
+const DEFAULT_DAYS = 3;                      // the first answer people see
+const EXTEND_DAYS = 14;                      // what "Make it 2 weeks" jumps to
+const DAY_OPTIONS = [3, 7, 14];              // choices on the Tune screen
+const DAY_LABELS = { 3: "3 days", 7: "1 week", 14: "2 weeks" };
+const PAYCHECK_OPTIONS = [1, 2, 3, 4, 6];    // buying-plan splits
+const SETUP_STEPS = 4;
+const SEARCH_GAP_MS = 1100;                  // Nominatim: max 1 request per second
 
 // Calories per day by person type, for food planning (rough adult averages).
 const CALORIES = { adults: 2000, older: 1800, kids: 1400 };
@@ -89,7 +98,7 @@ function defaultState() {
     people: { adults: 2, older: 0, kids: 0, babies: 0 },
     pets: { dogS: 0, dogM: 0, dogL: 0, cats: 0 },
     kit: "home",
-    days: 14,
+    days: DEFAULT_DAYS,
     threats: [],
     location: null,                   // { lat, lon, label }
     alerts: null,                     // { items: [...], fetchedAt, label }
@@ -98,7 +107,9 @@ function defaultState() {
     showMath: false,
     paychecks: 3,
     upkeep: {},
-    tab: "kit",
+    setupDone: false,                 // has the person finished the 4 setup screens?
+    editPrices: false,                // price boxes are hidden until asked for
+    openCats: {},                     // which kit-list categories are expanded
   };
 }
 
@@ -108,7 +119,10 @@ function loadState() {
     if (!raw) return defaultState();
     const saved = JSON.parse(raw);
     const d = defaultState();
-    return { ...d, ...saved, people: { ...d.people, ...saved.people }, pets: { ...d.pets, ...saved.pets } };
+    const merged = { ...d, ...saved, people: { ...d.people, ...saved.people }, pets: { ...d.pets, ...saved.pets } };
+    // v1 saves have no setupDone and a 14-day default nobody chose. Start v2 at 3 days.
+    if (!saved.setupDone) merged.days = DEFAULT_DAYS;
+    return merged;
   } catch (e) {
     return defaultState();
   }
@@ -426,86 +440,30 @@ function buildPlan(kit) {
   return { trips: trips.filter((tr) => tr.items.length), total, target };
 }
 
-/* ================= 5. RENDER ================= */
+/* ================= 5. SCREENS ================= */
 
-function renderInputs() {
-  $("peopleList").innerHTML = Object.entries(PEOPLE).map(([k, p]) => counterRow("people", k, p.label, p.note, state.people[k])).join("");
-  $("petList").innerHTML = Object.entries(PETS).map(([k, p]) => counterRow("pets", k, p.label, p.note, state.pets[k])).join("");
+// Routes are the part of the address after "#": #/setup/2, #/home, #/list ...
+// Links are plain <a href="#/list">, so the phone's Back button just works.
+const ROUTES = ["setup", "home", "list", "plan", "upkeep", "tune", "about"];
+const FOOD_IDS = ["cans", "pb", "bars", "trail"];
 
-  document.querySelectorAll("#kitSeg button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.kit === state.kit)));
-  document.querySelectorAll("#daysSeg button").forEach((b) => {
-    const isBag = state.kit === "bag";
-    b.disabled = isBag;
-    b.setAttribute("aria-pressed", String(isBag ? b.dataset.days === "3" : Number(b.dataset.days) === state.days));
-  });
-  $("kitHint").textContent = state.kit === "bag"
-    ? "A go-bag is what you grab if you have to leave. It covers 3 days and leaves out heavy stuff."
-    : "A home kit is for riding things out where you live. The Red Cross suggests 2 weeks.";
+const app = $("app");
+let alertStatus = state.location && !navigator.onLine ? "offline" : ""; // "", loading, offline, error, outside
+let locNote = null;   // message under the location box: { msg, err }
+let locDraft = "";    // what's typed in the location box, kept across redraws
+let locBusy = false;
+let lastSearch = 0;
 
-  const fa = alertThreats();
-  $("threatChips").innerHTML = Object.entries(THREATS).map(([k, t]) => {
-    const on = state.threats.includes(k) || !!fa[k];
-    return `<button type="button" class="chip ${fa[k] ? "from-alert" : ""}" data-threat="${k}" aria-pressed="${on}"
-      ${fa[k] ? `title="Switched on by the ${esc(fa[k])}"` : ""}>${t.label}</button>`;
-  }).join("");
+const sayList = (parts) => (parts.length > 1 ? parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1] : parts[0] || "");
+
+function route() {
+  const [name = "", arg] = location.hash.replace(/^#\/?/, "").split("/");
+  return { name, n: Math.min(SETUP_STEPS, Math.max(1, Number(arg) || 1)) };
 }
 
-function counterRow(group, key, label, note, n) {
-  return `<li class="counter">
-    <span class="counter-label">${label}${note ? `<small>${note}</small>` : ""}</span>
-    <span class="stepper">
-      <button type="button" data-group="${group}" data-key="${key}" data-step="-1" aria-label="One fewer: ${label}">−</button>
-      <output>${n}</output>
-      <button type="button" data-group="${group}" data-key="${key}" data-step="1" aria-label="One more: ${label}">+</button>
-    </span>
-  </li>`;
-}
+function go(path) { location.hash = "#/" + path; }
 
-function renderLocationStatus(msg, isError) {
-  const el = $("locStatus");
-  el.classList.toggle("is-error", !!isError);
-  if (msg) { el.innerHTML = msg; return; }
-  el.innerHTML = state.location ? `Checking alerts for <strong>${esc(state.location.label)}</strong>.` : "";
-}
-
-function renderAlerts(status) {
-  const box = $("alerts");
-  if (!state.location) {
-    box.innerHTML = `<div class="alert-box empty"><div class="alert-head"><h2>Live weather alerts</h2></div>
-      <p class="alert-meta" style="margin:6px 0 0">Add where you live and Ready checks the National Weather Service for alerts, then adjusts your kit.</p></div>`;
-    return;
-  }
-  const items = liveAlerts();
-  const when = state.alerts && state.alerts.fetchedAt ? fmtTime(state.alerts.fetchedAt) : "";
-  let meta = "";
-  if (status === "loading") meta = "Checking now…";
-  else if (status === "offline") meta = when ? `You're offline. Showing what was active as of ${when}.` : "You're offline. Connect to check for alerts.";
-  else if (status === "error") meta = "Couldn't reach the National Weather Service. Try again in a minute.";
-  else if (status === "outside") meta = "Weather alerts only cover the US.";
-  else if (when) meta = `Checked ${when}.`;
-
-  const refresh = `<button type="button" class="link-btn" id="refreshAlerts">Check again</button>`;
-
-  if (!items.length) {
-    box.innerHTML = `<div class="alert-box ${status === "error" || status === "outside" ? "empty" : "none"}">
-      <div class="alert-head"><h2>No active alerts for ${esc(state.location.label)}</h2>${refresh}</div>
-      <p class="alert-meta" style="margin:4px 0 0">${meta}</p></div>`;
-    return;
-  }
-  const worst = items.some((a) => alertLevel(a.event) === "warn") ? "warn" : items.some((a) => alertLevel(a.event) === "watch") ? "watch" : "advisory";
-  const fa = alertThreats();
-  const added = Object.keys(fa).map((k) => THREATS[k].label.toLowerCase());
-  box.innerHTML = `<div class="alert-box ${worst}">
-    <div class="alert-head"><h2>${plural(items.length, "active alert")} for ${esc(state.location.label)}</h2>${refresh}</div>
-    <ul class="alert-list">${items.map((a) => `
-      <li class="alert-item ${alertLevel(a.event)}">
-        <div class="alert-event">${esc(a.event)}</div>
-        <div class="alert-meta">${a.ends ? `Until ${esc(fmtTime(a.ends))}. ` : ""}${esc(a.sender)}</div>
-      </li>`).join("")}</ul>
-    ${added.length ? `<p class="alert-added">Your kit now includes extra supplies for ${added.join(" and ")}.</p>` : ""}
-    <p class="alert-meta" style="margin:6px 0 0">${meta}</p>
-  </div>`;
-}
+/* ---------- small pieces ---------- */
 
 function describeHousehold() {
   const parts = [];
@@ -517,9 +475,11 @@ function describeHousehold() {
   const dogs = state.pets.dogS + state.pets.dogM + state.pets.dogL;
   if (dogs) parts.push(plural(dogs, "dog"));
   if (state.pets.cats) parts.push(plural(state.pets.cats, "cat"));
-  if (!parts.length) return "nobody yet";
-  return parts.length > 1 ? parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1] : parts[0];
+  return parts.length ? sayList(parts) : "nobody yet";
 }
+
+function startOfToday() { const t = new Date(); return new Date(t.getFullYear(), t.getMonth(), t.getDate()); }
+function todayISO() { const t = new Date(); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`; }
 
 function upkeepStatus(u) {
   const last = state.upkeep[u.id];
@@ -533,64 +493,195 @@ function upkeepStatus(u) {
   return { cls: "ok", text: `Next check ${dueText}` };
 }
 
-function startOfToday() { const t = new Date(); return new Date(t.getFullYear(), t.getMonth(), t.getDate()); }
-function todayISO() { const t = new Date(); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`; }
-
-function renderSummary(kit) {
-  const late = UPKEEP.filter((u) => upkeepStatus(u).cls === "late").length;
-  $("summary").innerHTML = `
-    <div class="tag-band" aria-hidden="true"></div>
-    <div class="tag-body">
-      <p class="tag-for">${state.kit === "bag" ? "Go-bag" : "Home kit"} for ${esc(describeHousehold())}</p>
-      <div class="tag-grid">
-        <div class="stat"><span class="stat-num">${Math.ceil(kit.waterGal)}</span><span class="stat-label">gallons of water</span></div>
-        <div class="stat"><span class="stat-num">${kit.days}</span><span class="stat-label">days covered</span></div>
-        <div class="stat"><span class="stat-num">${roundMoney(kit.totals.cost)}</span><span class="stat-label">left to buy</span></div>
-        <div class="stat"><span class="stat-num">${kit.totals.itemsLeft}</span><span class="stat-label">of ${kit.totals.itemsAll} items to go</span></div>
-      </div>
-      ${late ? `<p class="tag-note">${plural(late, "part")} of your kit ${late === 1 ? "is" : "are"} overdue for a check. See Upkeep.</p>` : ""}
-    </div>`;
+function counterRow(group, key, label, note, n) {
+  return `<li class="counter">
+    <span class="counter-label">${label}${note ? `<small>${note}</small>` : ""}</span>
+    <span class="stepper">
+      <button type="button" data-action="step" data-group="${group}" data-key="${key}" data-step="-1" aria-label="One fewer: ${label}">−</button>
+      <output>${n}</output>
+      <button type="button" data-action="step" data-group="${group}" data-key="${key}" data-step="1" aria-label="One more: ${label}">+</button>
+    </span>
+  </li>`;
 }
 
-function renderKit(kit) {
-  if (!kit.lines.length) {
-    $("panel-kit").innerHTML = `<h3>Kit list</h3><p class="panel-intro">Add at least one person or pet on the left and your kit shows up here.</p>`;
-    return;
+const back = (href, label) => `<a class="back" href="${href}">← ${label || "Back"}</a>`;
+
+// The one-sentence answer. Only counts what's still left to buy.
+function headline(kit) {
+  if (!kit.lines.length) return `Add a person or pet to see your kit.`;
+  const left = kit.lines.filter((l) => !state.have[l.id]);
+  if (!left.length) return `You've got everything. Nice. Keep it fresh so it still works when you need it.`;
+  const num = (n) => `<strong class="num">${n}</strong>`;
+  const parts = [];
+  if (left.some((l) => l.id === "water")) {
+    const g = Math.ceil(kit.waterGal);
+    parts.push(`${num(g)} ${g === 1 ? "gallon" : "gallons"} of water`);
   }
-  const order = ["For your area", "Water and food", "Babies and pets", "First aid and health", "Light and power", "Tools and sanitation"];
-  const cats = order.map((c) => [c, kit.lines.filter((l) => l.cat === c)]).filter(([, ls]) => ls.length);
-
-  $("panel-kit").innerHTML = `
-    <div class="panel-head">
-      <h3>Kit list</h3>
-      <label class="toggle"><input type="checkbox" id="showMath" ${state.showMath ? "checked" : ""}> Show the math</label>
-    </div>
-    <p class="panel-intro">Check off what you already have and it drops out of the total. Prices are rough, so change them to match your store.</p>
-    ${orderCats(cats, kit).map(([c, ls]) => `
-      <div class="cat ${c === "For your area" ? "area" : ""}">
-        <h4>${c}</h4>
-        ${ls.map(itemRow).join("")}
-      </div>`).join("")}
-    <div class="kit-actions">
-      <button type="button" class="link-btn" id="copyList">Copy shopping list</button>
-      <button type="button" class="link-btn" id="resetPrices">Reset prices</button>
-    </div>`;
+  if (left.some((l) => FOOD_IDS.includes(l.id))) parts.push(`food for ${num(kit.days)} days`);
+  const other = left.filter((l) => l.id !== "water" && !FOOD_IDS.includes(l.id)).length;
+  if (other) parts.push(`${num(other)} other ${other === 1 ? "thing" : "things"}`);
+  const tail = kit.totals.cost > 0 ? `, about ${num(roundMoney(kit.totals.cost))}` : `. Nothing to buy.`;
+  return `You need ${sayList(parts)}${tail}${kit.totals.cost > 0 ? "." : ""}`;
 }
 
-// "For your area" goes first when a live alert added items, last otherwise.
-function orderCats(cats, kit) {
-  const area = cats.filter(([c]) => c === "For your area");
-  const rest = cats.filter(([c]) => c !== "For your area");
-  return Object.keys(kit.fromAlert).length ? [...area, ...rest] : [...rest, ...area];
+/* ---------- alerts: loud only when one is active ---------- */
+
+function alertMeta() {
+  const when = state.alerts && state.alerts.fetchedAt ? fmtTime(state.alerts.fetchedAt) : "";
+  if (alertStatus === "loading") return "Checking now…";
+  if (alertStatus === "offline") return when ? `You're offline. Showing what was active as of ${when}.` : "You're offline. Connect to check for alerts.";
+  if (alertStatus === "error") return "Couldn't reach the National Weather Service. Try again in a minute.";
+  if (alertStatus === "outside") return "Weather alerts only cover the US.";
+  return when ? `Checked ${when}.` : "";
+}
+
+function alertBanner(r) {
+  const items = liveAlerts();
+  if (!items.length || !state.location) return "";
+  const worst = items.some((a) => alertLevel(a.event) === "warn") ? "warn" : items.some((a) => alertLevel(a.event) === "watch") ? "watch" : "advisory";
+  const added = Object.keys(alertThreats()).map((k) => THREATS[k].label.toLowerCase());
+  return `<div class="banner ${worst}" role="status">
+    <div class="banner-head"><strong>${plural(items.length, "active alert")} for ${esc(state.location.label)}</strong>
+      <button type="button" class="link-btn" data-action="refresh">Check again</button></div>
+    <ul class="alert-list">${items.map((a) => `
+      <li class="alert-item ${alertLevel(a.event)}">
+        <div class="alert-event">${esc(a.event)}</div>
+        <div class="alert-meta">${a.ends ? `Until ${esc(fmtTime(a.ends))}. ` : ""}${esc(a.sender)}</div>
+      </li>`).join("")}</ul>
+    ${added.length ? `<p class="banner-added">Your kit now includes extra supplies for ${added.join(" and ")}.${r.name !== "list" ? ` <a href="#/list">See them</a>` : ""}</p>` : ""}
+    <p class="alert-meta">${alertMeta()}</p>
+  </div>`;
+}
+
+// No alerts: one quiet line on the answer screen, nothing anywhere else.
+function quietStatus() {
+  if (!state.location || liveAlerts().length) return "";
+  const when = state.alerts && state.alerts.fetchedAt ? fmtTime(state.alerts.fetchedAt) : "";
+  const label = esc(state.location.label);
+  let msg = "";
+  if (alertStatus === "loading") msg = "Checking alerts…";
+  else if (alertStatus === "offline") msg = when ? `Offline. No alerts for ${label} as of ${when}.` : "Offline. Connect to check for alerts.";
+  else if (alertStatus === "error") msg = "Couldn't reach the National Weather Service.";
+  else if (alertStatus === "outside") msg = "Weather alerts only cover the US.";
+  else if (when) msg = `No active alerts for ${label}. Checked ${when}.`;
+  return msg ? `<p class="quiet">${msg} <button type="button" class="link-btn" data-action="refresh">Check again</button></p>` : "";
+}
+
+/* ---------- setup: one question per screen ---------- */
+
+function screenSetup(n) {
+  const dots = Array.from({ length: SETUP_STEPS }, (_, i) => `<span class="dot ${i < n ? "on" : ""}"></span>`).join("");
+  const progress = `<div class="progress"><span>Step ${n} of ${SETUP_STEPS}</span><span class="dots" aria-hidden="true">${dots}</span></div>`;
+  const humans = state.people.adults + state.people.older + state.people.kids + state.people.babies;
+  const petsTotal = Object.values(state.pets).reduce((a, b) => a + b, 0);
+  const leftBtn = n === 1
+    ? (state.setupDone ? `<a class="btn btn-quiet big" href="#/home">Cancel</a>` : `<span></span>`)
+    : `<a class="btn btn-quiet big" href="#/setup/${n - 1}">Back</a>`;
+  const nav = (right) => `<div class="nav">${leftBtn}${right}</div>`;
+
+  if (n === 1) {
+    return `<section class="screen">${progress}
+      <h1 tabindex="-1">Who's in your household?</h1>
+      <p class="lede">Adults, kids and babies each need different things.</p>
+      <ul class="counters">${Object.entries(PEOPLE).map(([k, p]) => counterRow("people", k, p.label, p.note, state.people[k])).join("")}</ul>
+      ${humans ? "" : `<p class="hint">Add at least one person to go on.</p>`}
+      ${nav(humans ? `<a class="btn big" href="#/setup/2">Next</a>` : `<button type="button" class="btn big" disabled>Next</button>`)}
+    </section>`;
+  }
+  if (n === 2) {
+    return `<section class="screen">${progress}
+      <h1 tabindex="-1">Any pets?</h1>
+      <p class="lede">Their water and food get added to your kit.</p>
+      <ul class="counters">${Object.entries(PETS).map(([k, p]) => counterRow("pets", k, p.label, p.note, state.pets[k])).join("")}</ul>
+      ${nav(`<a class="btn big" href="#/setup/3">${petsTotal ? "Next" : "No pets"}</a>`)}
+    </section>`;
+  }
+  if (n === 3) {
+    const status = locNote ? locNote.msg : state.location ? `Using <strong>${esc(state.location.label)}</strong>.` : "";
+    return `<section class="screen">${progress}
+      <h1 tabindex="-1">Where do you live?</h1>
+      <p class="lede">Ready checks the National Weather Service for alerts there and adds what you'd need. You can skip this.</p>
+      <form class="loc-form" id="locForm">
+        <label class="sr-only" for="locInput">City or ZIP code</label>
+        <input type="text" id="locInput" placeholder="City or ZIP code" autocomplete="postal-code" enterkeyhint="search" value="${esc(locDraft)}">
+        <button type="submit" class="btn" ${locBusy ? "disabled" : ""}>Find</button>
+      </form>
+      <button type="button" class="link-btn" data-action="geo">Use my location</button>
+      <p class="loc-status ${locNote && locNote.err ? "is-error" : ""}" aria-live="polite">${status}</p>
+      <p class="hint">Place search by <a href="https://nominatim.openstreetmap.org/" target="_blank" rel="noopener">Nominatim</a>, data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>.</p>
+      ${nav(`<a class="btn big" href="#/setup/4">${state.location ? "Next" : "Skip for now"}</a>`)}
+    </section>`;
+  }
+  return `<section class="screen">${progress}
+    <h1 tabindex="-1">What kind of kit?</h1>
+    <div class="choices">
+      <button type="button" class="choice" data-action="kit" data-kit="home" aria-pressed="${state.kit === "home"}">
+        <strong>Home kit</strong><span>For riding things out where you live. Starts at ${DAY_LABELS[DEFAULT_DAYS]}, and you can extend it.</span></button>
+      <button type="button" class="choice" data-action="kit" data-kit="bag" aria-pressed="${state.kit === "bag"}">
+        <strong>Go-bag</strong><span>What you grab if you have to leave. ${DAY_LABELS[DEFAULT_DAYS]}, lighter things you can carry.</span></button>
+    </div>
+    ${nav(`<button type="button" class="btn big" data-action="finish">Show my kit</button>`)}
+  </section>`;
+}
+
+/* ---------- answer screen ---------- */
+
+function screenHome(kit) {
+  const plan = buildPlan(kit);
+  const sts = UPKEEP.map(upkeepStatus);
+  const late = sts.filter((s) => s.cls === "late").length;
+  const soon = sts.filter((s) => s.cls === "soon").length;
+  const unset = sts.filter((s) => s.cls === "unset").length;
+  const upkeepSub = late ? `<span class="row-sub warn">${plural(late, "check")} overdue</span>`
+    : soon ? `<span class="row-sub">${plural(soon, "check")} due soon</span>`
+    : unset === sts.length ? `<span class="row-sub">Track when things expire</span>`
+    : `<span class="row-sub">All up to date</span>`;
+  const extend = state.kit === "home" && kit.lines.length
+    ? (state.days < EXTEND_DAYS
+        ? `<button type="button" class="btn btn-quiet" data-action="days" data-days="${EXTEND_DAYS}">Make it ${DAY_LABELS[EXTEND_DAYS]}</button>`
+        : `<button type="button" class="btn btn-quiet" data-action="days" data-days="${DEFAULT_DAYS}">Back to ${DAY_LABELS[DEFAULT_DAYS]}</button>`)
+    : "";
+  const rows = kit.lines.length ? `
+    <nav class="rows" aria-label="Details">
+      <a class="row" href="#/list"><span class="row-title">See the list</span>
+        <span class="row-sub">${kit.totals.itemsLeft} of ${kit.totals.itemsAll} items left to buy</span><span class="chev" aria-hidden="true">›</span></a>
+      <a class="row" href="#/plan"><span class="row-title">Spread the cost</span>
+        <span class="row-sub">${plan.total > 0 ? `Over ${plural(state.paychecks, "paycheck")}, about ${roundMoney(plan.target)} each` : "Nothing left to buy"}</span><span class="chev" aria-hidden="true">›</span></a>
+      <a class="row" href="#/upkeep"><span class="row-title">Keep it fresh</span>
+        ${upkeepSub}<span class="chev" aria-hidden="true">›</span></a>
+    </nav>` : "";
+  return `<section class="screen">
+    <h1 class="sr-only" tabindex="-1">Your kit</h1>
+    <div class="tag">
+      <div class="tag-band" aria-hidden="true"></div>
+      <div class="tag-body">
+        <p class="tag-for">${state.kit === "bag" ? "Go-bag" : "Home kit"}, ${DAY_LABELS[kit.days] || plural(kit.days, "day")}, for ${esc(describeHousehold())}</p>
+        <p class="answer">${headline(kit)}</p>
+        ${extend}
+      </div>
+    </div>
+    ${rows}
+    <p class="links"><a href="#/tune">Tune for your area</a><a href="#/setup/1">Edit household</a></p>
+    ${quietStatus()}
+    <p class="quiet">A planning tool, not official guidance. In an emergency, follow local officials.</p>
+  </section>`;
+}
+
+/* ---------- details screens ---------- */
+
+// A category opens by hand, or on its own when a live alert added items to it.
+function isOpen(cat) {
+  if (state.openCats[cat] !== undefined) return state.openCats[cat];
+  return cat === "For your area" && Object.keys(alertThreats()).length > 0;
 }
 
 function itemRow(l) {
   const have = !!state.have[l.id];
   const buy = buyText(l);
-  const cost = l.reminder
-    ? `<span>No cost</span>`
-    : `<strong>${roundMoney(l.cost)}</strong>
-       <label class="price">$<input type="number" min="0" step="0.5" value="${priceOf(l.price)}" data-price="${l.price}" aria-label="Price per ${esc(l.unit)} for ${esc(l.name)}"> each</label>`;
+  const price = state.editPrices
+    ? `<label class="price">$<input type="number" min="0" step="0.5" value="${priceOf(l.price)}" data-price="${l.price}" aria-label="Price per ${esc(l.unit)} for ${esc(l.name)}"> each</label>`
+    : "";
+  const cost = l.reminder ? `<span>No cost</span>` : `<strong>${roundMoney(l.cost)}</strong>${price}`;
   return `<div class="item ${have ? "is-have" : ""} ${l.reminder ? "is-reminder" : ""}">
     <input type="checkbox" data-have="${l.id}" ${have ? "checked" : ""} aria-label="${l.reminder ? "Done" : "Already have"}: ${esc(l.name)}">
     <div>
@@ -603,198 +694,296 @@ function itemRow(l) {
   </div>`;
 }
 
-function renderPlan(kit) {
+function screenList(kit) {
+  if (!kit.lines.length) return `<section class="screen">${back("#/home")}<h1 tabindex="-1">Your list</h1><p class="lede">Add a person or pet first and your list shows up here.</p></section>`;
+  const order = ["For your area", "Water and food", "Babies and pets", "First aid and health", "Light and power", "Tools and sanitation"];
+  const cats = order.map((c) => [c, kit.lines.filter((l) => l.cat === c)]).filter(([, ls]) => ls.length);
+  const area = cats.filter(([c]) => c === "For your area");
+  const rest = cats.filter(([c]) => c !== "For your area");
+  const ordered = Object.keys(kit.fromAlert).length ? [...area, ...rest] : [...rest, ...area]; // alert items first
+  return `<section class="screen">
+    ${back("#/home")}
+    <h1 tabindex="-1">Your list</h1>
+    <p class="lede">${kit.totals.itemsLeft} left to buy, about ${roundMoney(kit.totals.cost)}. Tick what you already have and it drops out of the total.</p>
+    <div class="toolbar">
+      <label class="toggle"><input type="checkbox" id="showMath" ${state.showMath ? "checked" : ""}> Show the math</label>
+      <label class="toggle"><input type="checkbox" id="editPrices" ${state.editPrices ? "checked" : ""}> Edit prices</label>
+    </div>
+    ${ordered.map(([c, ls]) => {
+      const open = isOpen(c);
+      return `<div class="cat ${c === "For your area" ? "area" : ""}">
+        <button type="button" class="cat-head" data-action="cat" data-cat="${esc(c)}" aria-expanded="${open}">
+          <span class="cat-name">${c}</span><span class="cat-meta">${ls.filter((l) => !state.have[l.id]).length} left</span><span class="chev" aria-hidden="true">›</span>
+        </button>
+        <div class="cat-body" ${open ? "" : "hidden"}>${ls.map(itemRow).join("")}</div>
+      </div>`;
+    }).join("")}
+    <div class="kit-actions">
+      <button type="button" class="link-btn" data-action="copy">Copy shopping list</button>
+      ${state.editPrices ? `<button type="button" class="link-btn" data-action="reset-prices">Reset prices</button>` : ""}
+    </div>
+  </section>`;
+}
+
+function screenPlan(kit) {
   const plan = buildPlan(kit);
-  const steps = [1, 2, 3, 4, 6];
-  $("panel-plan").innerHTML = `
-    <div class="panel-head"><h3>Buying plan</h3></div>
-    <p class="panel-intro">Don't have ${roundMoney(plan.total)} right now? Spread it out. The most urgent things come first: water, food and anything a live alert added.</p>
+  return `<section class="screen">
+    ${back("#/home")}
+    <h1 tabindex="-1">Spread the cost</h1>
+    <p class="lede">${plan.total > 0 ? `Don't have ${roundMoney(plan.total)} right now? Spread it out. The most urgent things come first: water, food and anything a live alert added.` : "Nothing left to buy. You're set."}</p>
     <div class="plan-controls">
       <span>Split over</span>
-      <div class="seg" role="group" aria-label="Number of paychecks" id="paySeg">
-        ${steps.map((n) => `<button type="button" data-pay="${n}" aria-pressed="${state.paychecks === n}">${n}</button>`).join("")}
+      <div class="seg" role="group" aria-label="Number of paychecks">
+        ${PAYCHECK_OPTIONS.map((n) => `<button type="button" data-action="pay" data-pay="${n}" aria-pressed="${state.paychecks === n}">${n}</button>`).join("")}
       </div>
       <span>${state.paychecks === 1 ? "paycheck" : "paychecks"}</span>
     </div>
-    ${plan.trips.length ? plan.trips.map((tr, i) => `
+    ${plan.trips.map((tr, i) => `
       <div class="trip">
-        <div class="trip-head"><h4>${plan.trips.length === 1 ? "One trip" : `Paycheck ${i + 1}`}</h4><span class="trip-total">${roundMoney(tr.total)}</span></div>
-        <ul>${tr.items.map((it) => `<li>${esc(it.name)} <span>${esc((it.buy || `${it.packs} × ${it.unit}`))}, ${roundMoney(it.cost)}</span></li>`).join("")}</ul>
-      </div>`).join("") : `<p class="panel-intro">Nothing left to buy. You're set.</p>`}`;
+        <div class="trip-head"><h2>${plan.trips.length === 1 ? "One trip" : `Paycheck ${i + 1}`}</h2><span class="trip-total">${roundMoney(tr.total)}</span></div>
+        <ul>${tr.items.map((it) => `<li>${esc(it.name)} <span>${esc(it.buy || `${it.packs} × ${it.unit}`)}, ${roundMoney(it.cost)}</span></li>`).join("")}</ul>
+      </div>`).join("")}
+  </section>`;
 }
 
-function renderUpkeep() {
-  $("panel-upkeep").innerHTML = `
-    <div class="panel-head"><h3>Upkeep</h3></div>
-    <p class="panel-intro">A kit only helps if it still works. Put in when you last checked each part and Ready tells you when it's due again.</p>
+function screenUpkeep() {
+  return `<section class="screen">
+    ${back("#/home")}
+    <h1 tabindex="-1">Keep it fresh</h1>
+    <p class="lede">A kit only helps if it still works. Put in when you last checked each part and Ready tells you when it's due again.</p>
     ${UPKEEP.map((u) => {
       const s = upkeepStatus(u);
       return `<div class="upkeep-row">
-        <div><h4>${u.label}</h4><p class="upkeep-note">${u.note}${sourceLink(u.src)}</p></div>
+        <div><h2>${u.label}</h2><p class="upkeep-note">${u.note}${sourceLink(u.src)}</p></div>
         <label><span class="sr-only">Last checked: ${u.label}</span><input type="date" data-upkeep="${u.id}" value="${state.upkeep[u.id] || ""}" max="${todayISO()}"></label>
-        <button type="button" class="btn btn-quiet" data-checked="${u.id}">Checked today</button>
+        <button type="button" class="btn btn-quiet" data-action="checked" data-checked="${u.id}">Checked today</button>
         <span class="pill ${s.cls}">${s.text}</span>
       </div>`;
-    }).join("")}`;
+    }).join("")}
+  </section>`;
 }
 
-function renderTabs() {
-  document.querySelectorAll(".tab").forEach((t) => t.setAttribute("aria-selected", String(t.dataset.tab === state.tab)));
-  ["kit", "plan", "upkeep"].forEach((k) => ($("panel-" + k).hidden = k !== state.tab));
+function screenTune() {
+  const isBag = state.kit === "bag";
+  const fa = alertThreats();
+  return `<section class="screen">
+    ${back("#/home")}
+    <h1 tabindex="-1">Tune your kit</h1>
+    <div class="group">
+      <h2>Kit type</h2>
+      <div class="seg" role="group" aria-label="Kit type">
+        <button type="button" data-action="kit" data-kit="home" aria-pressed="${!isBag}">Home kit</button>
+        <button type="button" data-action="kit" data-kit="bag" aria-pressed="${isBag}">Go-bag</button>
+      </div>
+      <p class="hint">${isBag ? "A go-bag is what you grab if you have to leave. It covers 3 days and leaves out heavy stuff." : "A home kit is for riding things out where you live. The Red Cross suggests 2 weeks."}</p>
+    </div>
+    <div class="group">
+      <h2>Days to cover</h2>
+      <div class="seg" role="group" aria-label="Days to cover">
+        ${DAY_OPTIONS.map((d) => `<button type="button" data-action="days" data-days="${d}" ${isBag ? "disabled" : ""} aria-pressed="${isBag ? d === DEFAULT_DAYS : state.days === d}">${DAY_LABELS[d]}</button>`).join("")}
+      </div>
+    </div>
+    <div class="group">
+      <h2>What your area usually faces</h2>
+      <p class="hint">Pick any that apply. Live alerts get added on top of these.</p>
+      <div class="chips">${Object.entries(THREATS).map(([k, t]) => {
+        const on = state.threats.includes(k) || !!fa[k];
+        return `<button type="button" class="chip ${fa[k] ? "from-alert" : ""}" data-action="threat" data-threat="${k}" aria-pressed="${on}" ${fa[k] ? `title="Switched on by the ${esc(fa[k])}"` : ""}>${t.label}</button>`;
+      }).join("")}</div>
+    </div>
+    <div class="group">
+      <h2>Where you live</h2>
+      <p class="hint" style="margin:0 0 8px">${state.location ? `Checking alerts for <strong>${esc(state.location.label)}</strong>.` : "Not set. Add it to get live weather alerts."}</p>
+      <a href="#/setup/3">${state.location ? "Change place" : "Add place"}</a>
+    </div>
+  </section>`;
 }
 
-function renderAll(alertStatus) {
+function screenAbout() {
+  return `<section class="screen">
+    ${back(state.setupDone ? "#/home" : "#/setup/1")}
+    <h1 tabindex="-1">About and sources</h1>
+    <p class="lede">Ready is a planning tool, not official guidance. In an emergency, follow instructions from local officials.</p>
+    <p>Quantities follow <a href="${SOURCES.ready.url}" target="_blank" rel="noopener">Ready.gov</a> and <a href="${SOURCES.redcross.url}" target="_blank" rel="noopener">Red Cross</a> guidance where they give numbers: one gallon of water per person per day, a 7-day supply of prescriptions, and up to 2 weeks for a home kit. Some amounts (calories, food mix, diapers, batteries, hand warmers, electrolytes) and all prices are rough estimates. Prices you can edit.</p>
+    <p>Weather alerts come from the <a href="https://www.weather.gov/" target="_blank" rel="noopener">National Weather Service</a> and cover the US only. Place search uses <a href="https://nominatim.openstreetmap.org/" target="_blank" rel="noopener">Nominatim</a>, data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>.</p>
+    <p>Your plan is saved on this device only. There are no accounts.</p>
+  </section>`;
+}
+
+/* ---------- the router + redraw ---------- */
+
+// Remember which button or box had focus, so keyboard users don't get thrown to the top.
+function focusKey(el) {
+  if (!el || !app.contains(el)) return null;
+  if (el.id) return "#" + el.id;
+  return Object.keys(el.dataset).length ? JSON.stringify(el.dataset) : null;
+}
+function findByKey(key) {
+  if (!key) return null;
+  if (key[0] === "#") return document.getElementById(key.slice(1));
+  return [...app.querySelectorAll("[data-action],[data-have],[data-price],[data-upkeep]")].find((el) => JSON.stringify(el.dataset) === key) || null;
+}
+
+function render() {
+  const r = route();
+  if (!ROUTES.includes(r.name)) { go(state.setupDone ? "home" : "setup/1"); return; }
+  if (!state.setupDone && r.name !== "setup" && r.name !== "about") { go("setup/1"); return; }
+
+  const keep = focusKey(document.activeElement);
   const kit = computeKit();
-  renderInputs();
-  renderAlerts(alertStatus);
-  renderSummary(kit);
-  renderKit(kit);
-  renderPlan(kit);
-  renderUpkeep();
-  renderTabs();
+  const body = {
+    setup: () => screenSetup(r.n),
+    home: () => screenHome(kit),
+    list: () => screenList(kit),
+    plan: () => screenPlan(kit),
+    upkeep: () => screenUpkeep(),
+    tune: () => screenTune(),
+    about: () => screenAbout(),
+  }[r.name]();
+
+  app.innerHTML = (r.name === "setup" ? "" : alertBanner(r)) + body
+    + `<footer class="foot"><a href="#/about">About and sources</a></footer>`;
+  const f = findByKey(keep);
+  if (f) {
+    f.focus({ preventScroll: true });
+    if (f.type === "text") f.setSelectionRange(f.value.length, f.value.length);
+  }
   saveState();
 }
 
+window.addEventListener("hashchange", () => {
+  locNote = null;
+  render();
+  window.scrollTo(0, 0);
+  const h = app.querySelector("h1");
+  if (h) h.focus({ preventScroll: true });
+});
+
 /* ================= 6. EVENTS ================= */
 
-let lastAlertStatus = "";
+// Event delegation: ONE listener on #app catches every click, even on buttons
+// that were drawn after the page loaded. Each button says what it does in data-action.
 
 async function refreshAlerts() {
   if (!state.location) return;
-  if (!navigator.onLine) { lastAlertStatus = "offline"; renderAll(lastAlertStatus); return; }
-  renderAlerts("loading");
+  if (!navigator.onLine) { alertStatus = "offline"; render(); return; }
+  alertStatus = "loading";
+  render();
   try {
     const items = await fetchAlerts(state.location.lat, state.location.lon);
     state.alerts = { items, fetchedAt: new Date().toISOString() };
-    lastAlertStatus = "";
+    alertStatus = "";
   } catch (e) {
-    lastAlertStatus = e.message === "outside-us" ? "outside" : navigator.onLine ? "error" : "offline";
-    if (lastAlertStatus === "outside") state.alerts = { items: [], fetchedAt: new Date().toISOString() };
+    alertStatus = e.message === "outside-us" ? "outside" : navigator.onLine ? "error" : "offline";
+    if (alertStatus === "outside") state.alerts = { items: [], fetchedAt: new Date().toISOString() };
   }
-  renderAll(lastAlertStatus);
+  render();
 }
 
 async function setLocation(loc) {
   state.location = loc;
   state.alerts = null;
-  renderLocationStatus();
+  locNote = null;
   await refreshAlerts();
 }
 
-function bindEvents() {
-  // Household counters (people + pets share one handler)
-  document.querySelector(".panel").addEventListener("click", (e) => {
-    const b = e.target.closest("[data-step]");
-    if (b) {
-      const group = state[b.dataset.group];
-      group[b.dataset.key] = Math.max(0, Math.min(20, (group[b.dataset.key] || 0) + Number(b.dataset.step)));
-      renderAll(lastAlertStatus);
-      return;
-    }
-    const kitBtn = e.target.closest("[data-kit]");
-    if (kitBtn) { state.kit = kitBtn.dataset.kit; renderAll(lastAlertStatus); return; }
-    const dayBtn = e.target.closest("[data-days]");
-    if (dayBtn && !dayBtn.disabled) { state.days = Number(dayBtn.dataset.days); renderAll(lastAlertStatus); return; }
-    const chip = e.target.closest("[data-threat]");
-    if (chip) {
-      const k = chip.dataset.threat;
-      if (alertThreats()[k]) return; // switched on by a live alert, can't turn off
-      state.threats = state.threats.includes(k) ? state.threats.filter((t) => t !== k) : [...state.threats, k];
-      renderAll(lastAlertStatus);
-    }
-  });
+// Only runs when the person presses Find (Nominatim's rules: no search-as-you-type, 1 request per second).
+async function findPlace() {
+  const q = locDraft.trim();
+  if (!q) { locNote = { msg: "Type a city or ZIP code first.", err: true }; render(); return; }
+  if (Date.now() - lastSearch < SEARCH_GAP_MS) return;
+  lastSearch = Date.now();
+  locBusy = true;
+  locNote = { msg: "Looking that up…" };
+  render();
+  try {
+    const loc = await searchPlace(q);
+    locDraft = "";
+    locBusy = false;
+    await setLocation(loc);
+  } catch (err) {
+    locBusy = false;
+    locNote = { err: true, msg: err.message === "not-found"
+      ? `Couldn't find "${esc(q)}" in the US. Try a ZIP code or "City, ST".`
+      : "Couldn't search right now. Check your connection and try again." };
+    render();
+  }
+}
 
-  // Location search (only on submit, per Nominatim's rules)
-  let lastSearch = 0;
-  $("locForm").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const q = $("locInput").value.trim();
-    if (!q) { renderLocationStatus("Type a city or ZIP code first.", true); return; }
-    if (Date.now() - lastSearch < 1100) return;
-    lastSearch = Date.now();
-    const btn = $("locFind");
-    btn.disabled = true;
-    renderLocationStatus("Looking that up…");
-    try {
-      const loc = await searchPlace(q);
-      $("locInput").value = "";
-      await setLocation(loc);
-    } catch (err) {
-      renderLocationStatus(err.message === "not-found"
-        ? `Couldn't find "${esc(q)}" in the US. Try a ZIP code or "City, ST".`
-        : "Couldn't search right now. Check your connection and try again.", true);
-    } finally {
-      btn.disabled = false;
-    }
-  });
-
-  $("locGeo").addEventListener("click", () => {
-    if (!navigator.geolocation) { renderLocationStatus("This browser can't share your location. Type a city or ZIP instead.", true); return; }
-    renderLocationStatus("Finding you…");
-    navigator.geolocation.getCurrentPosition(async (pos) => {
-      const lat = pos.coords.latitude, lon = pos.coords.longitude;
-      const label = await nameForPoint(lat, lon);
-      await setLocation({ lat, lon, label });
-    }, () => renderLocationStatus("Location is off for this site. Type a city or ZIP instead.", true), { timeout: 10000, maximumAge: 600000 });
-  });
-
-  $("alerts").addEventListener("click", (e) => { if (e.target.id === "refreshAlerts") refreshAlerts(); });
-
-  document.querySelector(".tabs").addEventListener("click", (e) => {
-    const t = e.target.closest(".tab");
-    if (!t) return;
-    state.tab = t.dataset.tab;
-    renderTabs();
-    saveState();
-  });
-
-  // Kit list
-  const kitPanel = $("panel-kit");
-  kitPanel.addEventListener("change", (e) => {
-    const t = e.target;
-    if (t.id === "showMath") state.showMath = t.checked;
-    else if (t.dataset.have) state.have[t.dataset.have] = t.checked;
-    else if (t.dataset.price) {
-      const v = parseFloat(t.value);
-      if (!isNaN(v) && v >= 0) state.prices[t.dataset.price] = v;
-    }
-    renderAll(lastAlertStatus);
-  });
-  kitPanel.addEventListener("click", (e) => {
-    if (e.target.id === "resetPrices") { state.prices = {}; renderAll(lastAlertStatus); }
-    if (e.target.id === "copyList") copyList(e.target);
-  });
-
-  // Buying plan
-  $("panel-plan").addEventListener("click", (e) => {
-    const b = e.target.closest("[data-pay]");
-    if (b) { state.paychecks = Number(b.dataset.pay); renderAll(lastAlertStatus); }
-  });
-
-  // Upkeep
-  const up = $("panel-upkeep");
-  up.addEventListener("change", (e) => {
-    if (e.target.dataset.upkeep) { state.upkeep[e.target.dataset.upkeep] = e.target.value; renderAll(lastAlertStatus); }
-  });
-  up.addEventListener("click", (e) => {
-    const b = e.target.closest("[data-checked]");
-    if (b) { state.upkeep[b.dataset.checked] = todayISO(); renderAll(lastAlertStatus); }
-  });
-
-  window.addEventListener("online", refreshAlerts);
+function useGps() {
+  if (!navigator.geolocation) { locNote = { msg: "This browser can't share your location. Type a city or ZIP instead.", err: true }; render(); return; }
+  locNote = { msg: "Finding you…" };
+  render();
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    const label = await nameForPoint(lat, lon);
+    await setLocation({ lat, lon, label });
+  }, () => { locNote = { msg: "Location is off for this site. Type a city or ZIP instead.", err: true }; render(); }, { timeout: 10000, maximumAge: 600000 });
 }
 
 function copyList(btn) {
   const kit = computeKit();
   const rows = kit.lines.filter((l) => !state.have[l.id]).map((l) => `- ${l.name}: ${(l.buy || `${l.packs} × ${l.unit}`)}${l.reminder ? "" : ` (${roundMoney(l.cost)})`}`);
   const text = `Ready kit shopping list\n${rows.join("\n")}\nTotal: ${roundMoney(kit.totals.cost)}`;
-  const done = () => { btn.textContent = "Copied"; setTimeout(() => (btn.textContent = "Copy shopping list"), 1500); };
+  const done = () => { btn.textContent = "Copied"; setTimeout(() => { if (btn.isConnected) btn.textContent = "Copy shopping list"; }, 1500); };
   if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => window.prompt("Copy this:", text));
   else window.prompt("Copy this:", text);
 }
 
+const ACTIONS = {
+  step(b) {
+    const group = state[b.dataset.group];
+    group[b.dataset.key] = Math.max(0, Math.min(20, (group[b.dataset.key] || 0) + Number(b.dataset.step)));
+    render();
+  },
+  kit(b) { state.kit = b.dataset.kit; render(); },
+  days(b) { if (!b.disabled) { state.days = Number(b.dataset.days); render(); } },
+  threat(b) {
+    const k = b.dataset.threat;
+    if (alertThreats()[k]) return; // switched on by a live alert, can't turn off
+    state.threats = state.threats.includes(k) ? state.threats.filter((t) => t !== k) : [...state.threats, k];
+    render();
+  },
+  cat(b) { state.openCats[b.dataset.cat] = !isOpen(b.dataset.cat); render(); },
+  pay(b) { state.paychecks = Number(b.dataset.pay); render(); },
+  checked(b) { state.upkeep[b.dataset.checked] = todayISO(); render(); },
+  refresh() { refreshAlerts(); },
+  geo() { useGps(); },
+  copy(b) { copyList(b); },
+  "reset-prices"() { state.prices = {}; render(); },
+  finish() { state.setupDone = true; saveState(); go("home"); },
+};
+
+function bindEvents() {
+  app.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-action]");
+    if (b && ACTIONS[b.dataset.action]) ACTIONS[b.dataset.action](b);
+  });
+
+  app.addEventListener("input", (e) => { if (e.target.id === "locInput") locDraft = e.target.value; });
+
+  app.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (e.target.id === "locForm") findPlace();
+  });
+
+  app.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.id === "showMath") state.showMath = t.checked;
+    else if (t.id === "editPrices") state.editPrices = t.checked;
+    else if (t.dataset.have) state.have[t.dataset.have] = t.checked;
+    else if (t.dataset.price) {
+      const v = parseFloat(t.value);
+      if (!isNaN(v) && v >= 0) state.prices[t.dataset.price] = v;
+    } else if (t.dataset.upkeep) state.upkeep[t.dataset.upkeep] = t.value;
+    else return;
+    render();
+  });
+
+  window.addEventListener("online", refreshAlerts);
+}
+
 /* ================= START ================= */
 bindEvents();
-renderLocationStatus();
-renderAll(state.location && !navigator.onLine ? "offline" : "");
-if (state.location) refreshAlerts();
+render();
+if (state.location && state.setupDone) refreshAlerts();
